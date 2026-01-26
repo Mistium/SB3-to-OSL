@@ -226,9 +226,8 @@ function resolveInput(input) {
       // Store the variable name for later reference
       variable_names[input[2]] = input[1];
       const targetStr = getTargetForVariable(input[2], current_target);
-      
-      const knownType = typeTracker.getVariableType(input[2]);
-      return new TypedInput(`${targetStr}.variables["${input[1]}"]`, knownType);
+    
+      return new TypedInput(`${targetStr}.variables["${input[1]}"]`, TYPES.UNKNOWN);
     }
 
     case 13: { // List reference
@@ -1681,8 +1680,6 @@ each target targets (
   source = headerSource + targetSource + blockSource
 
   source += `\n\ngreenflag()\nmainloop:\nrenderFrame()\nwindow_timer = timer - start_timer`;
-
-  typeTracker.printStats();
 
   fs.writeFileSync(path.join(__dirname, 'compiled.osl'), source);
   console.log('Compiled OSL file created successfully.');
