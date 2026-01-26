@@ -1,3 +1,4 @@
 *.sb3
 .vscode/
 *.osl
+.DS_Store
