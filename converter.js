@@ -225,9 +225,10 @@ function resolveInput(input) {
     case 12: { // Variable reference
       // Store the variable name for later reference
       variable_names[input[2]] = input[1];
-
       const targetStr = getTargetForVariable(input[2], current_target);
-      return new TypedInput(`${targetStr}.variables["${input[1]}"]`, TYPES.UNKNOWN);
+      
+      const knownType = typeTracker.getVariableType(input[2]);
+      return new TypedInput(`${targetStr}.variables["${input[1]}"]`, knownType);
     }
 
     case 13: { // List reference
@@ -340,6 +341,7 @@ class Input {
 class ConstantInput extends Input {
   constructor(value, type) {
     super(value);
+    this.rawValue = value;
     this.value = `${value}`;
     this.type = type;
   }
@@ -362,6 +364,7 @@ class ConstantInput extends Input {
   }
 
   isConstant(value) {
+    if (typeof value === 'number') return parseFloat(this.value) === value;
     return this.value === value;
   }
 }
@@ -395,6 +398,71 @@ class TypedInput extends Input {
     return false;
   }
 }
+
+class Optimizer {
+  constructor() {
+    this.constantsEvaluated = 0;
+    this.deadCodeRemoved = 0;
+  }
+
+  foldBinaryOp(opcode, left, right) {
+    if (!(left instanceof ConstantInput && right instanceof ConstantInput)) {
+      return null;
+    }
+
+    const l = parseFloat(left.value);
+    const r = parseFloat(right.value);
+    let result;
+
+    switch (opcode) {
+      case 'operator_add': result = l + r; break;
+      case 'operator_subtract': result = l - r; break;
+      case 'operator_multiply': result = l * r; break;
+      case 'operator_divide': result = l / r; break;
+      case 'operator_mod': result = l % r; break;
+      case 'operator_gt': return new ConstantInput(l > r, TYPES.BOOLEAN);
+      case 'operator_lt': return new ConstantInput(l < r, TYPES.BOOLEAN);
+      case 'operator_equals': 
+        return new ConstantInput(left.value === right.value, TYPES.BOOLEAN);
+      default: return null;
+    }
+
+    this.constantsEvaluated++;
+    return new ConstantInput(result, TYPES.NUMBER);
+  }
+
+  simplifyAdd(left, right) {
+    if (left.isConstant(0)) return right;
+    if (right.isConstant(0)) return left;
+    return null;
+  }
+
+  simplifyMultiply(left, right) {
+    if (left.isConstant(0) || right.isConstant(0)) {
+      this.deadCodeRemoved++;
+      return new ConstantInput(0, TYPES.NUMBER);
+    }
+    if (left.isConstant(1)) return right;
+    if (right.isConstant(1)) return left;
+    return null;
+  }
+
+  simplifySubtract(left, right) {
+    if (right.isConstant(0)) return left;
+    return null;
+  }
+
+  simplifyDivide(left, right) {
+    if (right.isConstant(1)) return left;
+    if (left.isConstant(0)) {
+      this.deadCodeRemoved++;
+      return new ConstantInput(0, TYPES.NUMBER);
+    }
+    return null;
+  }
+}
+
+const optimizer = new Optimizer();
 
 function resolveBlock(block, target) {
   if (!block) return "";
@@ -432,17 +500,17 @@ function resolveBlock(block, target) {
       } case 'motion_ifonedgebounce': {
         return `ifOnEdgeBounce(target)\n`;
       } case 'motion_movesteps': {
-        const steps = resolveInput(block.inputs.STEPS).toNum();
-        if (steps === 0) return '';
-        return `target.moveSteps(${steps})\n`;
+        const steps = resolveInput(block.inputs.STEPS);
+        if (steps.isConstant(0)) return '';
+        return `target.moveSteps(${steps.toNum()})\n`;
       } case 'motion_turnright': {
-        const degrees = resolveInput(block.inputs.DEGREES).toNum();
-        if (degrees === 0) return '';
-        return `target.direction += ${degrees}\n`;
+        const degrees = resolveInput(block.inputs.DEGREES);
+        if (degrees.isConstant(0)) return '';
+        return `target.direction += ${degrees.toNum()}\n`;
       } case 'motion_turnleft': {
-        const degrees = resolveInput(block.inputs.DEGREES).toNum();
-        if (degrees === 0) return '';
-        return `target.direction -= ${degrees}\n`;
+        const degrees = resolveInput(block.inputs.DEGREES);
+        if (degrees.isConstant(0)) return '';
+        return `target.direction -= ${degrees.toNum()}\n`;
       } case 'motion_setrotationstyle': {
         return `target.rotationStyle = "${block.fields.STYLE[0]}"\n`;
       } case 'motion_setx': {
@@ -478,20 +546,20 @@ function resolveBlock(block, target) {
         const variableId = block.fields.VARIABLE[1];
         variable_names[variableId] = variableName;
 
-        const value = resolveInput(block.inputs.VALUE).toUnknown();
+        const value = resolveInput(block.inputs.VALUE);
         const targetStr = getTargetForVariable(variableId, current_target);
 
-        return `${targetStr}.variables["${variableName}"] = ${value}\n`;
+        return `${targetStr}.variables["${variableName}"] = ${value.toUnknown()}\n`;
       } case 'data_changevariableby': {
         const variableName = block.fields.VARIABLE[0];
         const variableId = block.fields.VARIABLE[1];
         variable_names[variableId] = variableName;
 
-        const value = resolveInput(block.inputs.VALUE).toNum();
+        const value = resolveInput(block.inputs.VALUE);
         const targetStr = getTargetForVariable(variableId, current_target);
         const varStr = `${targetStr}.variables["${variableName}"]`
 
-        return `${varStr} = ${varStr}.toNum() + ${value}\n`;
+        return `${varStr} = ${varStr}.toNum() + ${value.toNum()}\n`;
       } case 'data_showvariable': {
         const variableName = block.fields.VARIABLE[0];
         const variableId = block.fields.VARIABLE[1];
@@ -666,9 +734,16 @@ function resolveBlock(block, target) {
         const body = processCBlock(block, target);
         return `while ${condition.toBool()}.not() (\n${body}wait 0.01\n)\n`;
       } case 'control_repeat': {
-        const times = resolveInput(block.inputs.TIMES).toNum();
+        const times = resolveInput(block.inputs.TIMES);
         const body = processCBlock(block, target);
-        return `loop ${times} (\n${body}defer\n)\n`;
+        if (times instanceof ConstantInput && +times.toNum() <= 3) {
+          if (times.value <= 0) return '';
+          if (times.isConstant(1)) return body;
+          if (body.split("\n").length < 5) {
+            return `${body}defer\n`.repeat(times.value - 1);
+          }
+        }
+        return `loop ${times.toNum()} (\n${body}defer\n)\n`;
       } case 'control_wait': {
         const time = resolveInput(block.inputs.DURATION).toNum();
         return `wait ${time}\n`;
@@ -897,6 +972,8 @@ function resolveBlock(block, target) {
         return new TypedInput(`(${target} == "_edge_" ? isTouchingEdge(target) isTouching(target, getTargetByName(${target})))`, TYPES.BOOLEAN);
       } case 'sensing_touchingobjectmenu': {
         return new ConstantInput(block.fields.TOUCHINGOBJECTMENU[0], TYPES.STRING);
+      } case 'sensing_touchingcolor': {
+        return new ConstantInput("false", TYPES.BOOLEAN);
       } case 'sensing_askandwait': {
         const question = resolveInput(block.inputs.QUESTION);
         return `answerVar = (${question}).ask() ?? ""\n`;
@@ -945,24 +1022,54 @@ function resolveBlock(block, target) {
         const right = resolveInput(block.inputs.OPERAND2);
         return new TypedInput(`(${left.toNum()} < ${right.toNum()})`, TYPES.BOOLEAN);
       } case 'operator_add': {
-        const left = resolveInput(block.inputs.NUM1) || 0;
-        const right = resolveInput(block.inputs.NUM2) || 0;
+        const left = resolveInput(block.inputs.NUM1) || new ConstantInput(0, TYPES.NUMBER);
+        const right = resolveInput(block.inputs.NUM2) || new ConstantInput(0, TYPES.NUMBER);
+        
+        const folded = optimizer.foldBinaryOp('operator_add', left, right);
+        if (folded) return folded;
+        
+        const simplified = optimizer.simplifyAdd(left, right);
+        if (simplified) return simplified;
         return new TypedInput(`(${left.toNum()} + ${right.toNum()})`, TYPES.NUMBER);
       } case 'operator_subtract': {
-        const left = resolveInput(block.inputs.NUM1) || 0;
-        const right = resolveInput(block.inputs.NUM2) || 0;
+        const left = resolveInput(block.inputs.NUM1) || new ConstantInput(0, TYPES.NUMBER);
+        const right = resolveInput(block.inputs.NUM2) || new ConstantInput(0, TYPES.NUMBER);
+        
+        const folded = optimizer.foldBinaryOp('operator_subtract', left, right);
+        if (folded) return folded;
+        
+        const simplified = optimizer.simplifySubtract(left, right);
+        if (simplified) return simplified;
         return new TypedInput(`(${left.toNum()} - ${right.toNum()})`, TYPES.NUMBER);
       } case 'operator_multiply': {
-        const left = resolveInput(block.inputs.NUM1) || 0;
-        const right = resolveInput(block.inputs.NUM2) || 0;
+        const left = resolveInput(block.inputs.NUM1) || new ConstantInput(0, TYPES.NUMBER);
+        const right = resolveInput(block.inputs.NUM2) || new ConstantInput(0, TYPES.NUMBER);
+        
+        const folded = optimizer.foldBinaryOp('operator_multiply', left, right);
+        if (folded) return folded;
+        
+        const simplified = optimizer.simplifyMultiply(left, right);
+        if (simplified) return simplified;
         return new TypedInput(`(${left.toNum()} * ${right.toNum()})`, TYPES.NUMBER);
       } case 'operator_divide': {
-        const left = resolveInput(block.inputs.NUM1) || 0;
-        const right = resolveInput(block.inputs.NUM2) || 0;
+        const left = resolveInput(block.inputs.NUM1) || new ConstantInput(0, TYPES.NUMBER);
+        const right = resolveInput(block.inputs.NUM2) || new ConstantInput(0, TYPES.NUMBER);
+        
+        const folded = optimizer.foldBinaryOp('operator_divide', left, right);
+        if (folded) return folded;
+        
+        const simplified = optimizer.simplifyDivide(left, right);
+        if (simplified) return simplified;
         return new TypedInput(`(${left.toNum()} / ${right.toNum()})`, TYPES.NUMBER);
       } case 'operator_mod': {
-        const left = resolveInput(block.inputs.NUM1) || 0;
-        const right = resolveInput(block.inputs.NUM2) || 0;
+        const left = resolveInput(block.inputs.NUM1) || new ConstantInput(0, TYPES.NUMBER);
+        const right = resolveInput(block.inputs.NUM2) || new ConstantInput(0, TYPES.NUMBER);
+        
+        const folded = optimizer.foldBinaryOp('operator_mod', left, right);
+        if (folded) return folded;
+        
+        const simplified = optimizer.simplifyDivide(left, right);
+        if (simplified) return simplified;
         return new TypedInput(`(${left.toNum()} % ${right.toNum()})`, TYPES.NUMBER);
       } case 'operator_and': {
         const left = resolveInput(block.inputs.OPERAND1);
@@ -1003,6 +1110,8 @@ function resolveBlock(block, target) {
         const paramName = ['', 'transparency'][param];
         const color = resolveInput(block.inputs.VALUE).toString();
         return `target.pen.params["${paramName}"] = ${color}\n`;
+      } case 'pen_stamp': {
+        return ""
       } default:
         return new TypedInput(`/* Unhandled block: ${block.opcode} */`, TYPES.UNKNOWN);
     }
@@ -1027,7 +1136,6 @@ monitor_text_value = #ffffff
 
 answerVar = ""
 targets = []
-greenflag = []
 threads = {}
 window_timer = 0
 start_timer = timer
@@ -1216,8 +1324,8 @@ def ifOnEdgeBounce(object target) (
 def greenflag() (
   for i targets.len (
     local target @= targets[i]
-    for i target.greenflag.len (
-      runThread(target.greenflag[i], target, true)
+    for j target.greenflag.len (
+      runThread(target.greenflag[j], target, true)
     )
   )
 )
@@ -1373,6 +1481,8 @@ def renderFrame() (
       change width * scale height * scale
       break
   )
+  direction 90
+  stretch [100, 100]
   effect "clear"
   image url stage.size * 4.80 * width / 480 * scale
 
@@ -1413,11 +1523,12 @@ def renderFrame() (
       switch target.rotationStyle (
         case "left-right"
           stretch "x" target.direction > 0 ? 100 -100
+          direction 90
           break
         case "dont-rotate"
           direction 90
           break
-        case "all around"
+        default
           direction target.direction
           break
       )
@@ -1505,6 +1616,11 @@ def renderFrame() (
       broadcasts[name] = [];
     }
 
+    let sounds = {};
+    for (const key in target.sounds) {
+      sounds[target.sounds[key].name] = target.sounds[key];
+    }
+
     let costumes = target.costumes.map((v, i) => { v.id = i + ":" + v.name; return v }) ?? []
     if (target.changesCostume !== true) {
       costumes = [target.costumes[target.currentCostume]]
@@ -1526,7 +1642,7 @@ def renderFrame() (
   rotationStyle: "${target.rotationStyle ?? "all around"}",
   size: ${target.size ?? 100},
   costumes: ${JSON.stringify(costumes)},
-  sounds: ${target.usesSounds ? JSON.stringify(target.sounds) : '[]'},
+  sounds: ${target.usesSounds && false ? JSON.stringify(sounds) : '{}'},
   variables: ${JSON.stringify(vars)},
   lists: ${JSON.stringify(lists)},
   shown: ${target.visible ?? true},
@@ -1566,12 +1682,14 @@ each target targets (
 
   source += `\n\ngreenflag()\nmainloop:\nrenderFrame()\nwindow_timer = timer - start_timer`;
 
+  typeTracker.printStats();
+
   fs.writeFileSync(path.join(__dirname, 'compiled.osl'), source);
   console.log('Compiled OSL file created successfully.');
   return file;
 }
 
-const project = expandSb3File("refraction.sb3",{
+const project = expandSb3File("Little Square.sb3",{
   assetOptimization: true,
   extractAssets: true
 });
